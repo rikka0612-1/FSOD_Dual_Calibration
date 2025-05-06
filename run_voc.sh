@@ -41,7 +41,7 @@ do
         "${CKPT_DIR}/base${split}/model_final.pth"
     for seed in `seq 0 29`
     do
-        for shot in 1 2 3 5 10
+        for shot in 1
         do
             python main.py --num-gpus $NGPU --config-file configs/voc/fsod.yaml \
                 DATASETS.TRAIN "('voc_2007+2012_trainval_all${split}_${shot}shot_seed${seed}', )" \
