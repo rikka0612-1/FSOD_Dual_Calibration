@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --partition=gpu
 #SBATCH --qos=gpu
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:3
 #SBATCH --mem=82G
 
 export DETECTRON2_DATASETS="./dataset"
 EXP_TAG=`[ -z "$1" ] && echo "$(date +%s)" || echo "$1"`
 CKPT_DIR="checkpoints/voc/${EXP_TAG}"
-NGPU=2
+NGPU=3
 
 . ./hashmap.sh
 
