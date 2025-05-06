@@ -7,7 +7,7 @@
 export DETECTRON2_DATASETS="./dataset"
 EXP_TAG=`[ -z "$1" ] && echo "$(date +%s)" || echo "$1"`
 CKPT_DIR="checkpoints/voc/${EXP_TAG}"
-NGPU=4
+NGPU=2
 
 . ./hashmap.sh
 
