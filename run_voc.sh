@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --partition=gpu
 #SBATCH --qos=gpu
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:3
 #SBATCH --mem=82G
 
 export DETECTRON2_DATASETS="./dataset"
 EXP_TAG=`[ -z "$1" ] && echo "$(date +%s)" || echo "$1"`
 CKPT_DIR="checkpoints/voc/${EXP_TAG}"
-NGPU=4
+NGPU=3
 
 . ./hashmap.sh
 
@@ -17,7 +17,7 @@ STEPS=$(create_hashmap)
 trap "exit" INT
 trap "cleanup $MAX_ITER && cleanup $STEPS" exit
 
-add_item "$MAX_ITER" 1 1000
+add_item "$MAX_ITER" 1 20
 add_item "$MAX_ITER" 2 1500
 add_item "$MAX_ITER" 3 2000
 add_item "$MAX_ITER" 5 2500
