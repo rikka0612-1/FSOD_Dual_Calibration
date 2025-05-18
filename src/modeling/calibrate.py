@@ -21,79 +21,78 @@ logger = logging.getLogger("detectron2")
 
 
 @lru_cache(maxsize=None)
-def extract_support_rois(cfg: bytes):
-    cfg = pkl.loads(cfg)
+def extract_support_rois(cfg_bytes: bytes):
+    # Deserialize config
+    cfg = pkl.loads(cfg_bytes)
     device = torch.device(cfg.MODEL.DEVICE)
 
+    # Initialize backbone and pooler
     cfg.defrost()
     cfg.MODEL.RESNETS.OUT_FEATURES = ["res5"]
     cfg.freeze()
-
     backbone = build_backbone(cfg)
-    backbone.stem.fc = torch.nn.Linear(2048, 1000)
-    _level = logger.getEffectiveLevel()
-    # suppress logging
-    logger.setLevel(logging.CRITICAL)
+    backbone.stem.fc = nn.Linear(2048, 1000)
     DetectionCheckpointer(backbone).resume_or_load("./pretrain/R-101.pkl")
-    logger.setLevel(_level)
     backbone.eval()
+    backbone.to(device)
     for param in backbone.parameters():
         param.requires_grad_(False)
-    backbone.to(device)
     pooler = ROIPooler(
         output_size=(1, 1),
-        scales=(1 / 32.0,),
-        sampling_ratio=(0),
-        pooler_type="ROIAlignV2",
+        scales=(1.0 / 32,),
+        sampling_ratio=0,
+        pooler_type="ROIAlignV2"
     )
 
-    px_mean = torch.tensor(cfg.MODEL.PIXEL_MEAN).view(-1, 1, 1).to(device)
-    px_std = torch.tensor(cfg.MODEL.PIXEL_STD).view(-1, 1, 1).to(device)
+    # image normalization
+    mean = torch.tensor(cfg.MODEL.PIXEL_MEAN, device=device).view(-1, 1, 1)
+    std = torch.tensor(cfg.MODEL.PIXEL_STD, device=device).view(-1, 1, 1)
 
-    def read_image(filename):
-        image = utils.read_image(filename, format=cfg.INPUT.FORMAT).copy()
-        image = torch.from_numpy(image).permute(2, 0, 1).to(device)
-        image = (image - px_mean) / px_std
-        image = ImageList.from_tensors([image], 0)
-        return image.tensor
+    # collect all support samples
+    support_samples = []
+    for dataset_name in cfg.DATASETS.TRAIN:
+        dataset = DatasetCatalog.get(dataset_name)
+        support_samples.extend(dataset)
 
-    support_set = []
-    for dataset in cfg.DATASETS.TRAIN:
-        support_set.extend(DatasetCatalog.get(dataset))
-
-    samples = defaultdict(list)
-    for data in support_set:
-        image = read_image(data["file_name"])
-        instances = utils.annotations_to_instances(
-            data["annotations"], image.shape[-2:]
-        )
+    # Collect features for each category
+    category_features = {}
+    for sample in support_samples:
+        # Read and preprocess image
+        img = utils.read_image(sample["file_name"], format=cfg.INPUT.FORMAT)
+        img_tensor = torch.from_numpy(img).permute(2, 0, 1).float().to(device)
+        img_tensor = (img_tensor - mean) / std
+        imglist = ImageList.from_tensors([img_tensor], 0)
+        # Extract features
+        with torch.no_grad():
+            feat_map = backbone(imglist.tensor)["res5"]
+        # Get instances and ROI features
+        instances = utils.annotations_to_instances(sample["annotations"], img_tensor.shape[1:])
         boxes = instances.gt_boxes.to(device)
-        features = torch.flatten(pooler([backbone(image)["res5"]], [boxes]), 1)
-        # features = F.normalize(features, dim=1)
-        for i, cat_id in enumerate(instances.gt_classes):
-            samples[cat_id.item()].append(features[i])
+        pooled_feats = pooler([feat_map], [boxes]).flatten(1)
+        for i, cls_id in enumerate(instances.gt_classes.tolist()):
+            if cls_id not in category_features:
+                category_features[cls_id] = []
+            category_features[cls_id].append(pooled_feats[i])
 
-    support_features = []
-    masks = []
+    # Assemble support features and masks
     shot = int(cfg.DATASETS.TRAIN[0].split("_")[4].replace("shot", ""))
-    for key in sorted(samples):
-        if len(samples[key]) < shot:
-            feature = torch.stack(samples[key])
-            n, c = feature.shape
-            l = shot - n
-            ph = torch.zeros(l, c).to(feature)
-            feature = torch.cat([feature, ph], dim=0)
-            mask = torch.ones(n + l, 1).to(feature)
-            mask[-l:] = 0
+    all_feats, all_masks = [], []
+    for cls in sorted(category_features.keys()):
+        feats = category_features[cls]
+        mask = [1] * min(len(feats), shot)
+        if len(feats) < shot:
+            # Pad zeros if not enough shots
+            pad = [torch.zeros_like(feats[0]) for _ in range(shot - len(feats))]
+            feats = feats + pad
+            mask += [0] * (shot - len(mask))
         else:
-            feature = torch.stack(samples[key])
-            mask = torch.ones(shot, 1).to(feature)
-        support_features.append(feature)
-        masks.append(mask)
+            feats = feats[:shot]
+        all_feats.append(torch.stack(feats))
+        all_masks.append(torch.tensor(mask, dtype=torch.float32, device=feats[0].device).unsqueeze(1))
 
-    support_features = torch.stack(support_features)
-    masks = torch.stack(masks)
-    return support_features.detach().cpu(), masks.detach().cpu()
+    support_tensor = torch.stack(all_feats).cpu()
+    mask_tensor = torch.stack(all_masks).cpu()
+    return support_tensor, mask_tensor
 
 
 class Calibrate(FastRCNNOutputLayers):
@@ -137,49 +136,76 @@ class Calibrate(FastRCNNOutputLayers):
     @classmethod
     @lru_cache(maxsize=None)
     def learn_mapping(
-        cls, supp_features, mask, device_id: str = "cpu", eps: float = 1e-6
+        cls, support_feats, mask, device_id: str = "cpu", tol: float = 1e-6, max_iter: int = 1000
     ):
+
         device = torch.device(device_id)
-        N, k, d = supp_features.shape
-        x = supp_features.reshape(N * k, -1).to(device)
-        m = mask.reshape(N * k, 1).to(device)
-        m = m.matmul(m.T)
-        fc = nn.Linear(d, d, bias=False)
-        nn.init.normal_(fc.weight.data, 0, 0.01)
-        if fc.bias is not None:
-            nn.init.zeros_(fc.bias.data)
-        fc.to(device)
-        t = F.one_hot(repeat(torch.arange(N), "N -> (N k)", k=k), num_classes=N)
-        t = t.matmul(t.T).float().to(device)
-        opt = torch.optim.SGD(fc.parameters(), lr=1.0)
-        loss = torch.tensor(torch.inf)
-        prev_loss = 0
-        while abs(loss.item() - prev_loss) > eps:
-            prev_loss = loss.item()
-            z = fc(x)
-            loss = F.mse_loss(cls.cosine_similarity(z, z), t, reduction="none")
-            loss = torch.sum(loss * m) / m.sum()
-            opt.zero_grad()
+        n_cls, n_shot, feat_dim = support_feats.shape
+
+        # Flatten features and mask
+        flat_feats = support_feats.view(-1, feat_dim).to(device)
+        flat_mask = mask.view(-1, 1).to(device)
+        mask_matrix = flat_mask @ flat_mask.t()
+
+        # Build target similarity matrix
+        labels = torch.arange(n_cls, device=device).repeat_interleave(n_shot)
+        target = (labels.unsqueeze(1) == labels.unsqueeze(0)).float()
+
+        # Initialize linear mapping
+        mapper = nn.Linear(feat_dim, feat_dim, bias=False).to(device)
+        nn.init.normal_(mapper.weight, mean=0, std=0.01)
+        optimizer = torch.optim.SGD(mapper.parameters(), lr=1.0)
+
+        last_loss = None
+        for step in range(max_iter):
+            proj = mapper(flat_feats)
+            sim = F.normalize(proj, dim=1) @ F.normalize(proj, dim=1).t()
+            mse = (sim - target) ** 2
+            loss = (mse * mask_matrix).sum() / mask_matrix.sum()
+
+            if last_loss is not None and abs(loss.item() - last_loss) < tol:
+                break
+            last_loss = loss.item()
+
+            optimizer.zero_grad()
             loss.backward()
-            opt.step()
-        logger.info(f"Loss: {loss.item():.4f}")
-        return fc.cpu()
+            optimizer.step()
+
+        logger.info(f"[learn_mapping-re] Final loss: {loss.item():.6f}")
+        return mapper.cpu()
 
     @staticmethod
     def cosine_similarity(x, y, eps=1e-8):
         return F.normalize(x, dim=-1, eps=eps).matmul(F.normalize(y, dim=-1, eps=eps).T)
 
     def forward(self, x):
-        if x.dim() > 2:
-            x = torch.flatten(x, start_dim=1)
-        proposal_deltas = self.bbox_pred(x)
-        scores = self.cls_score(self.dropout(x))
-        cos_simm = self.cosine_similarity(self.fc(x), self.fc(self.fsup))
+        # Flatten features if needed
+        if features.dim() > 2:
+            features = features.flatten(start_dim=1)
+
+        # Bounding box regression branch
+        bbox_deltas = self.bbox_pred(features)
+
+        # Classification branch
+        logits = self.cls_score(self.dropout(features))
+
+        # Feature space mapping
+        support_proj = self.fc(self.fsup)
+        query_proj = self.fc(features)
+        sim_scores = self.cosine_similarity(query_proj, support_proj)
+
+        # Normalization factors
         with torch.no_grad():
-            tau_cls = scores.norm(dim=1, keepdim=True)
-            tau_cos = cos_simm.norm(dim=1, keepdim=True)
-        scores = scores * tau_cos
-        cos_simm = cos_simm * tau_cls
-        cls_scores, bg_score = scores.split(cos_simm.shape[1], dim=1)
-        scores = torch.cat([cls_scores + cos_simm, bg_score + tau_cls], dim=1) / 2
-        return scores, proposal_deltas
+            norm_logits = logits.norm(dim=1, keepdim=True)
+            norm_sim = sim_scores.norm(dim=1, keepdim=True)
+
+        # Calibrate logits and similarity scores
+        logits_calibrated = logits * norm_sim
+        sim_calibrated = sim_scores * norm_logits
+
+        
+        num_fg = sim_scores.shape[1]
+        fg_logits, bg_logits = logits_calibrated.split(num_fg, dim=1)
+        final_scores = torch.cat([fg_logits + sim_calibrated, bg_logits + norm_logits], dim=1) / 2
+
+        return final_scores, bbox_deltas
