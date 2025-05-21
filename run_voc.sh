@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH --partition=gpu
 #SBATCH --qos=gpu
-#SBATCH --gres=gpu:3
+#SBATCH --gres=gpu:4
 #SBATCH --mem=82G
 
 export DETECTRON2_DATASETS="./dataset"
 EXP_TAG=`[ -z "$1" ] && echo "$(date +%s)" || echo "$1"`
 CKPT_DIR="checkpoints/voc/${EXP_TAG}"
-NGPU=3
+NGPU=4
 
 . ./hashmap.sh
 
@@ -17,7 +17,7 @@ STEPS=$(create_hashmap)
 trap "exit" INT
 trap "cleanup $MAX_ITER && cleanup $STEPS" exit
 
-add_item "$MAX_ITER" 1 20
+add_item "$MAX_ITER" 1 1000
 add_item "$MAX_ITER" 2 1500
 add_item "$MAX_ITER" 3 2000
 add_item "$MAX_ITER" 5 2500
@@ -29,7 +29,8 @@ add_item "$STEPS" 3 "(1600, )"
 add_item "$STEPS" 5 "(2000, )"
 add_item "$STEPS" 10 "(3200, )"
 
-for split in `seq 1 3`
+
+for split in `seq 1 2 3`
 do
     python main.py --num-gpus $NGPU --config-file configs/voc/base.yaml \
         DATASETS.TRAIN "('voc_2007+2012_trainval_base${split}', )" \
@@ -41,7 +42,7 @@ do
         "${CKPT_DIR}/base${split}/model_final.pth"
     for seed in `seq 0 29`
     do
-        for shot in 1
+        for shot in 1 2 3 5 10
         do
             python main.py --num-gpus $NGPU --config-file configs/voc/fsod.yaml \
                 DATASETS.TRAIN "('voc_2007+2012_trainval_all${split}_${shot}shot_seed${seed}', )" \

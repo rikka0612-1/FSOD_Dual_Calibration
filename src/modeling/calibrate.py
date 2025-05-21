@@ -61,7 +61,7 @@ def extract_support_rois(cfg_bytes: bytes):
         img = utils.read_image(sample["file_name"], format=cfg.INPUT.FORMAT)
         img_tensor = torch.from_numpy(img).permute(2, 0, 1).float().to(device)
         img_tensor = (img_tensor - mean) / std
-        imglist = ImageList.from_tensors([img_tensor], 0)
+        imglist = ImageList.from_tensors([img_tensor], 0) 
         # Extract features
         with torch.no_grad():
             feat_map = backbone(imglist.tensor)["res5"]
@@ -180,8 +180,10 @@ class Calibrate(FastRCNNOutputLayers):
 
     def forward(self, x):
         # Flatten features if needed
-        if features.dim() > 2:
-            features = features.flatten(start_dim=1)
+        if x.dim() > 2:
+            features = x.flatten(start_dim=1)
+        else:
+            features = x
 
         # Bounding box regression branch
         bbox_deltas = self.bbox_pred(features)
